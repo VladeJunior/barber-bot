@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import cors from 'cors';
 import axios from 'axios';
@@ -14,100 +14,99 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL; 
 
-// --- GERENCIADOR DE SESSÕES (A MÁGICA ACONTECE AQUI) ---
-// Mapeia "instanceId" -> Objeto da Conexão
-const sessions = new Map<string, any>();
-const qrCodes = new Map<string, string>(); // Guarda o QR Code de cada ID
+// --- CACHE DE RETRY ---
+// Lógica simples para guardar tentativas de mensagem
+const localMsgRetryMap = new Map<string, number>();
+const msgRetryCounterCache = {
+    get: (key: string) => { return localMsgRetryMap.get(key) },
+    set: (key: string, value: number) => { localMsgRetryMap.set(key, value) },
+    del: (key: string) => { localMsgRetryMap.delete(key) },
+    flushAll: () => { localMsgRetryMap.clear() }
+};
 
-// Função para iniciar uma sessão específica
+const sessions = new Map<string, any>();
+const qrCodes = new Map<string, string>();
+
 async function startSession(instanceId: string) {
-    // Se já existe e está conectado, não faz nada
-    if (sessions.has(instanceId) && !sessions.get(instanceId).destroyed) {
+    // Se a sessão existe e o socket está aberto, retorna ela
+    if (sessions.has(instanceId) && !sessions.get(instanceId).ws.isClosed) {
         return sessions.get(instanceId);
     }
 
     const sessionPath = path.join('auth_info_baileys', instanceId);
-    
-    // Cria a pasta se não existir
-    if (!fs.existsSync(sessionPath)){
-        fs.mkdirSync(sessionPath, { recursive: true });
-    }
+    if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
+        version,
         auth: state,
         printQRInTerminal: false,
         
-        // --- A MÁGICA PARA NÃO TRAVAR ---
-        // 1. Diz que somos um Chrome no Ubuntu (Linux), que bate com a realidade da Railway
-        browser: Browsers.ubuntu('Chrome'), 
+        // --- CONFIGURAÇÃO BLINDADA ---
+        // Usamos 'as any' para o TypeScript parar de reclamar do Cache
+        msgRetryCounterCache: msgRetryCounterCache as any, 
         
-        // 2. Não baixa o histórico antigo (isso trava muito servidor pequeno)
-        syncFullHistory: false,
-
-        // 3. Aumenta a paciência da conexão (Evita o erro "Não foi possível conectar")
-        connectTimeoutMs: 60000, 
-        defaultQueryTimeoutMs: 60000,
+        // Navegador genérico que passa bem em servidores Linux
+        browser: ["InfoBarber", "Chrome", "120.0.6099.0"], 
+        
+        connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 500,
-        
-        // 4. Configurações extras de estabilidade
         emitOwnEvents: true,
-        fireInitQueries: false, // Deixa inicializar mais rápido
+        fireInitQueries: false,
         generateHighQualityLinkPreview: true,
+        syncFullHistory: false,
+        markOnlineOnConnect: true,
     });
 
-    // Salva na memória
     sessions.set(instanceId, sock);
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', (update: any) => {
+    sock.ev.on('connection.update', async (update: any) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log(`QR Code gerado para: ${instanceId}`);
+            console.log(`QR Code novo para: ${instanceId}`);
             qrCodes.set(instanceId, qr);
         }
 
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`Conexão fechada para ${instanceId}. Reconectando...`, shouldReconnect);
-            
-            if (shouldReconnect) {
-                startSession(instanceId); // Tenta reconectar a mesma instância
+            const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
+            console.log(`Conexão fechada: ${instanceId}. Razão: ${reason}`);
+
+            // Se não for logout (401), tenta reconectar
+            if (reason !== DisconnectReason.loggedOut) {
+                setTimeout(() => startSession(instanceId), 3000);
             } else {
-                console.log(`Logout definitivo de ${instanceId}`);
                 sessions.delete(instanceId);
                 qrCodes.delete(instanceId);
-                // Opcional: Apagar a pasta de credenciais se quiser resetar total
+                // Limpeza completa se for logout real
+                if (fs.existsSync(sessionPath)) {
+                    fs.rmSync(sessionPath, { recursive: true, force: true });
+                }
             }
         } else if (connection === 'open') {
-            console.log(`Conexão aberta para: ${instanceId}`);
-            qrCodes.delete(instanceId); // Limpa o QR Code pois já conectou
+            console.log(`✅ Conexão estabelecida: ${instanceId}`);
+            qrCodes.delete(instanceId);
         }
     });
 
-    // WEBHOOK: Agora sabemos QUAL instância recebeu a mensagem
+    // WEBHOOK
     sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
         if (type === 'notify') {
             for (const msg of messages) {
                 if (!msg.key.fromMe && WEBHOOK_URL) {
-                    const webhookPayload = {
-                        event: "webhookReceived",
-                        instanceId: instanceId, // <--- AQUI ESTÁ A RESPOSTA DA SUA DÚVIDA
-                        connectedPhone: sock?.user?.id?.split(':')[0],
-                        messageId: msg.key.id,
-                        sender: msg.key.remoteJid.split('@')[0],
-                        msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
-                    };
-                    
                     try {
-                        // Enviamos para o InfoBarber dizendo: "Essa msg chegou para a barbearia X"
-                        await axios.post(WEBHOOK_URL, webhookPayload);
+                        await axios.post(WEBHOOK_URL, {
+                            event: "webhookReceived",
+                            instanceId: instanceId,
+                            connectedPhone: sock?.user?.id?.split(':')[0],
+                            msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
+                        });
                     } catch (e) {
-                        console.error('Erro webhook', e);
+                        // Silencia erro de webhook
                     }
                 }
             }
@@ -117,178 +116,95 @@ async function startSession(instanceId: string) {
     return sock;
 }
 
-// Inicializa as pastas existentes ao ligar o servidor (Reconecta quem já estava salvo)
-// Isso garante que se o servidor reiniciar, as barbearias voltam online sozinhas
+// Inicia sessões salvas (Auto-Start)
 if (fs.existsSync('auth_info_baileys')) {
     const existingSessions = fs.readdirSync('auth_info_baileys');
     existingSessions.forEach(id => {
-        if (fs.statSync(path.join('auth_info_baileys', id)).isDirectory()) {
-            console.log(`Restaurando sessão: ${id}`);
+        if (id !== '.DS_Store' && fs.statSync(path.join('auth_info_baileys', id)).isDirectory()) {
+            console.log(`Restaurando: ${id}`);
             startSession(id);
         }
     });
 }
 
-// --- ROTAS (Adaptação Multi-Tenant) ---
+// --- ROTAS API ---
 
-// 1. Pegar QR Code (Cria a instância se não existir)
-// GET /v1/instance/qr-code?instanceId=barbearia_01
 app.get('/v1/instance/qr-code', async (req: Request, res: Response) => {
-    // Tenta pegar do query (?instanceId=...) ou do body (se for POST)
-    const instanceId = req.query.instanceId as string || req.body.instanceId;
+    const instanceId = req.query.instanceId as string;
+    if (!instanceId) return res.status(400).json({ error: true, message: "Falta instanceId" });
 
-    if (!instanceId) {
-        return res.status(400).json({ error: true, message: "instanceId é obrigatório" });
-    }
-
-    // Se a sessão não existe, cria agora (Lazy Loading)
-    if (!sessions.has(instanceId)) {
-        await startSession(instanceId);
-    }
-
-    // Aguarda um pouquinho para ver se conecta ou gera QR
-    // (Gambiarra leve para dar tempo do Baileys gerar o primeiro QR)
-    await new Promise(r => setTimeout(r, 1000));
+    if (!sessions.has(instanceId)) await startSession(instanceId);
+    await new Promise(r => setTimeout(r, 2000));
 
     const session = sessions.get(instanceId);
-    
-    // Verifica status (se 'user' existe, está conectado)
-    if (session?.user) {
-        return res.json({ error: false, message: "Instância já conectada", connected: true });
-    }
+    if (session?.user) return res.json({ error: false, connected: true });
 
     const qr = qrCodes.get(instanceId);
-
-    if (!qr) {
-        return res.status(404).json({ error: true, message: "Gerando QR Code... Tente novamente em 2s" });
-    }
+    if (!qr) return res.status(404).json({ error: true, message: "Aguardando QR..." });
 
     const base64Image = await QRCode.toDataURL(qr);
-    return res.json({
-        error: false,
-        instanceId: instanceId,
-        qrcode: base64Image
-    });
+    return res.json({ error: false, instanceId, qrcode: base64Image });
 });
 
-// 2. Enviar Texto
-// POST /v1/message/send-text
 app.post('/v1/message/send-text', async (req: Request, res: Response): Promise<any> => {
-    // Agora o InfoBarber PRECISA mandar o instanceId no JSON ou na URL
-    const { phone, message, instanceId } = req.body; 
-    // OBS: Se o InfoBarber manda instanceId na URL (query), use req.query.instanceId
+    const { phone, message, instanceId } = req.body;
+    const target = instanceId || req.query.instanceId;
 
-    // Prioridade: Body > Query
-    const targetInstance = instanceId || req.query.instanceId;
-
-    if (!targetInstance || !sessions.has(targetInstance as string)) {
-        return res.status(404).json({ error: true, message: "Instância não encontrada ou desconectada" });
+    if (!target || !sessions.has(target as string)) {
+        return res.status(404).json({ error: true, message: "Instância desconectada" });
     }
 
-    const sock = sessions.get(targetInstance as string);
-
-    // Verifica se está realmente conectado
-    if (!sock.user) {
-        return res.status(503).json({ error: true, message: "Instância existe mas não está conectada ao WhatsApp" });
-    }
-
+    const sock = sessions.get(target as string);
     try {
         const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
         const result = await sock.sendMessage(jid, { text: message });
-
-        return res.json({
-            error: false,
-            instanceId: targetInstance,
-            messageId: result.key.id
-        });
+        return res.json({ error: false, messageId: result.key.id });
     } catch (error) {
-        console.error(error);
-        return res.status(500).json({ error: true, message: "Erro ao enviar" });
+        return res.status(500).json({ error: true });
     }
 });
 
-// 3. Status
-app.get('/v1/instance/status-instance', (req: Request, res: Response) => {
+// Rota de Reset (GET)
+app.get('/v1/instance/reset', async (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
-    
-    if (!instanceId || !sessions.has(instanceId)) {
-         return res.json({ instanceId: instanceId, connected: false });
-    }
+    if (!instanceId) return res.status(400).send("Falta instanceId");
 
-    const sock = sessions.get(instanceId);
-    return res.json({
-        instanceId: instanceId,
-        connected: !!sock.user // Retorna true se tiver usuário logado
-    });
-});
-
-// 4. Logout
-app.post('/v1/instance/logout', async (req: Request, res: Response) => {
-    const instanceId = req.query.instanceId as string || req.body.instanceId;
-    
-    if (instanceId && sessions.has(instanceId)) {
-        const sock = sessions.get(instanceId);
-        await sock.logout();
-        sessions.delete(instanceId);
-        qrCodes.delete(instanceId);
-        // Removemos a pasta para garantir que o próximo login seja limpo
-        const sessionPath = path.join('auth_info_baileys', instanceId);
-        fs.rmSync(sessionPath, { recursive: true, force: true });
-        
-        return res.json({ error: false, message: "Desconectado" });
-    }
-    return res.json({ error: false, message: "Sessão não encontrada" });
-});
-// 5. Rota de Reset (Apaga a sessão e força novo QR Code)
-// POST /v1/instance/reset?instanceId=barbearia_01
-app.post('/v1/instance/reset', async (req: Request, res: Response) => {
-    const instanceId = req.query.instanceId as string || req.body.instanceId;
-    
-    if (!instanceId) return res.status(400).json({ error: true, message: "instanceId obrigatório" });
-
-    // 1. Desconecta se estiver rodando
     if (sessions.has(instanceId)) {
-        const sock = sessions.get(instanceId);
-        sock.end(undefined); // Encerra a conexão brutalmente
+        try { sessions.get(instanceId).end(undefined); } catch(e){}
         sessions.delete(instanceId);
         qrCodes.delete(instanceId);
     }
 
-    // 2. Apaga os arquivos físicos (O "Hard Reset")
-    const sessionPath = path.join('auth_info_baileys', instanceId);
-    if (fs.existsSync(sessionPath)) {
-        try {
-            fs.rmSync(sessionPath, { recursive: true, force: true });
-            console.log(`Pasta de sessão ${instanceId} apagada.`);
-        } catch (e) {
-            console.error("Erro ao apagar pasta:", e);
-        }
-    }
+    const p = path.join('auth_info_baileys', instanceId);
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
 
-    return res.json({ 
-        error: false, 
-        message: `Instância ${instanceId} resetada. Pode pedir novo QR Code agora.` 
-    });
+    return res.json({ message: "Resetado com sucesso." });
 });
-// --- ROTA VISUAL (Para testar no navegador) ---
+
+// Rota Visual HTML
 app.get('/connect', async (req: Request, res: Response) => {
-    // Exige passar ?instanceId=nome_da_loja
     const instanceId = req.query.instanceId as string;
-    if (!instanceId) return res.send("Informe ?instanceId=nome_da_loja na URL");
+    if (!instanceId) return res.send("Use ?instanceId=SEU_ID");
 
-    // Lógica igual à do JSON, mas retorna HTML
     if (!sessions.has(instanceId)) await startSession(instanceId);
-    await new Promise(r => setTimeout(r, 1000));
+    await new Promise(r => setTimeout(r, 2000));
+
     const session = sessions.get(instanceId);
-    
-    if (session?.user) return res.send("<h1>Conectado!</h1>");
+    if (session?.user) return res.send("<h1 style='color:green'>CONECTADO! ✅ Pode fechar.</h1>");
+
     const qr = qrCodes.get(instanceId);
-    if (!qr) return res.send("Generating QR... Refresh page.");
-    
-    const base64Image = await QRCode.toDataURL(qr);
-    return res.send(`<img src="${base64Image}" /> <script>setTimeout(()=>location.reload(), 5000)</script>`);
+    if (!qr) return res.send("<meta http-equiv='refresh' content='2'><h2>Gerando QR... aguarde...</h2>");
+
+    const img = await QRCode.toDataURL(qr);
+    return res.send(`
+        <div style="text-align:center; font-family:sans-serif;">
+            <h2>Escaneie para Conectar</h2>
+            <img src="${img}" width="300" />
+            <br><br>
+            <p>Se der erro no celular, tente novamente.</p>
+            <script>setTimeout(()=>location.reload(), 5000)</script>
+        </div>
+    `);
 });
 
-app.listen(PORT, () => {
-    console.log(`🚀 Servidor Multi-Tenant rodando na porta ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
