@@ -38,16 +38,24 @@ async function startSession(instanceId: string) {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        // MUDANÇA 1: Usar Ubuntu/Chrome (mais estável em servidores Linux/Docker)
-        browser: Browsers.ubuntu('Chrome'),
-        // MUDANÇA 2: Aumentar timeouts para evitar que o celular desista
+        
+        // --- A MÁGICA PARA NÃO TRAVAR ---
+        // 1. Diz que somos um Chrome no Ubuntu (Linux), que bate com a realidade da Railway
+        browser: Browsers.ubuntu('Chrome'), 
+        
+        // 2. Não baixa o histórico antigo (isso trava muito servidor pequeno)
+        syncFullHistory: false,
+
+        // 3. Aumenta a paciência da conexão (Evita o erro "Não foi possível conectar")
         connectTimeoutMs: 60000, 
         defaultQueryTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
+        retryRequestDelayMs: 500,
+        
+        // 4. Configurações extras de estabilidade
         emitOwnEvents: true,
-        retryRequestDelayMs: 250,
-        // MUDANÇA 3: Ignorar chamadas de histórico antigo (deixa mais leve)
-        syncFullHistory: false 
+        fireInitQueries: false, // Deixa inicializar mais rápido
+        generateHighQualityLinkPreview: true,
     });
 
     // Salva na memória
