@@ -6,6 +6,7 @@ import fs from 'fs';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import qrcodeTerminal from 'qrcode-terminal';
+import QRCode from 'qrcode';
 
 dotenv.config();
 
@@ -149,7 +150,7 @@ app.get('/v1/instance/qr-code', async (req: Request, res: Response) => {
 
     // W-API retorna o base64 direto no JSON
     // A gente usa uma lib para gerar a imagem do QR Code em Base64
-    const QRCode = require('qrcode');
+    
     const base64Image = await QRCode.toDataURL(qrCodeData);
 
     return res.json({
