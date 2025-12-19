@@ -88,29 +88,42 @@ async function startSession(instanceId: string) {
     sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
         if (type === 'notify') {
             for (const msg of messages) {
-                // Só processa se não for mensagem minha e se tiver URL configurada
-                if (!msg.key.fromMe && WEBHOOK_URL) {
+                // 1. Ignora mensagens enviadas por mim
+                if (msg.key.fromMe) continue;
+
+                // 2. PEGA O JID COMPLETO (ex: 5519...@s.whatsapp.net ou ...@lid)
+                const remoteJid = msg.key.remoteJid;
+                
+                // 3. FILTRO ANTI-LID: Se for @lid, ignora (espera vir o do telefone)
+                // O WhatsApp costuma mandar os dois eventos. Vamos pegar só o de telefone.
+                if (remoteJid.includes('@lid')) {
+                    console.log(`⚠️ Ignorando mensagem vinda de LID: ${remoteJid}`);
+                    continue;
+                }
+
+                // Só processa se tiver URL configurada
+                if (WEBHOOK_URL) {
                     
-                    console.log(`📩 Mensagem recebida em ${instanceId}. Tentando enviar Webhook...`);
+                    console.log(`📩 Mensagem recebida de: ${remoteJid}`); // Log para conferir
                     
                     try {
                         const payload = {
                             event: "webhookReceived",
                             instanceId: instanceId,
                             connectedPhone: sock?.user?.id?.split(':')[0],
-                            sender: msg.key.remoteJid?.split('@')[0],
+                            // Remove o @s.whatsapp.net e pega só o número limpo
+                            sender: remoteJid.split('@')[0], 
                             msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
                         };
 
+                        if (!payload.msgContent) continue; // Ignora msg vazia
+
                         // Envia para o Supabase/Lovable
                         await axios.post(WEBHOOK_URL, payload);
-                        console.log(`🚀 WEBHOOK ENVIADO COM SUCESSO PARA: ${WEBHOOK_URL}`);
+                        console.log(`🚀 WEBHOOK ENVIADO: ${payload.sender} disse "${payload.msgContent}"`);
                         
                     } catch (e: any) {
                         console.error(`❌ ERRO NO WEBHOOK: ${e.message}`);
-                        if (e.response) {
-                            console.error(`Status: ${e.response.status}, Data: ${JSON.stringify(e.response.data)}`);
-                        }
                     }
                 }
             }
