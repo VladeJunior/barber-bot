@@ -2,38 +2,48 @@ import express, { Request, Response } from 'express';
 import { makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import cors from 'cors';
-import fs from 'fs';
 import axios from 'axios';
-import dotenv from 'dotenv';
-import qrcodeTerminal from 'qrcode-terminal';
 import QRCode from 'qrcode';
-
-dotenv.config();
+import fs from 'fs';
+import path from 'path';
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// CONFIGURAÇÕES
 const PORT = process.env.PORT || 3000;
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // URL do seu InfoBarber para receber respostas
-const AUTH_FOLDER = 'auth_info_baileys';
+const WEBHOOK_URL = process.env.WEBHOOK_URL; 
 
-// ESTADO GLOBAL (Para manter na memória)
-let sock: any;
-let qrCodeData: string | null = null;
-let connectionStatus = 'disconnected';
+// --- GERENCIADOR DE SESSÕES (A MÁGICA ACONTECE AQUI) ---
+// Mapeia "instanceId" -> Objeto da Conexão
+const sessions = new Map<string, any>();
+const qrCodes = new Map<string, string>(); // Guarda o QR Code de cada ID
 
-// FUNÇÃO: Conectar ao WhatsApp
-async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+// Função para iniciar uma sessão específica
+async function startSession(instanceId: string) {
+    // Se já existe e está conectado, não faz nada
+    if (sessions.has(instanceId) && !sessions.get(instanceId).destroyed) {
+        return sessions.get(instanceId);
+    }
 
-    sock = makeWASocket({
+    const sessionPath = path.join('auth_info_baileys', instanceId);
+    
+    // Cria a pasta se não existir
+    if (!fs.existsSync(sessionPath)){
+        fs.mkdirSync(sessionPath, { recursive: true });
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+
+    const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true,
-        browser: Browsers.macOS('Desktop'), // Finge ser um Mac para não dar erro
+        printQRInTerminal: false,
+        browser: Browsers.macOS('Desktop'),
         syncFullHistory: false
     });
+
+    // Salva na memória
+    sessions.set(instanceId, sock);
 
     sock.ev.on('creds.update', saveCreds);
 
@@ -41,136 +51,198 @@ async function connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('Novo QR Code gerado');
-            // Transforma o QR Code em Base64 para enviar ao frontend igual a W-API faz
-            qrCodeData = qr; 
-            connectionStatus = 'qrcode_ready';
-
-            qrcodeTerminal.generate(qr, { small: true });
+            console.log(`QR Code gerado para: ${instanceId}`);
+            qrCodes.set(instanceId, qr);
         }
 
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Conexão fechada. Reconectando...', shouldReconnect);
-            connectionStatus = 'disconnected';
+            console.log(`Conexão fechada para ${instanceId}. Reconectando...`, shouldReconnect);
+            
             if (shouldReconnect) {
-                connectToWhatsApp();
+                startSession(instanceId); // Tenta reconectar a mesma instância
+            } else {
+                console.log(`Logout definitivo de ${instanceId}`);
+                sessions.delete(instanceId);
+                qrCodes.delete(instanceId);
+                // Opcional: Apagar a pasta de credenciais se quiser resetar total
             }
         } else if (connection === 'open') {
-            console.log('Conexão aberta com sucesso!');
-            connectionStatus = 'connected';
-            qrCodeData = null; // Limpa o QR pois já conectou
+            console.log(`Conexão aberta para: ${instanceId}`);
+            qrCodes.delete(instanceId); // Limpa o QR Code pois já conectou
         }
     });
 
-    // LISTENER: Receber mensagens (Onde você cria o BOT depois)
+    // WEBHOOK: Agora sabemos QUAL instância recebeu a mensagem
     sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
         if (type === 'notify') {
             for (const msg of messages) {
                 if (!msg.key.fromMe && WEBHOOK_URL) {
-                    // Aqui enviamos para o seu InfoBarber processar (se quiser)
-                    // Formata um JSON parecido com o webhook da W-API
                     const webhookPayload = {
                         event: "webhookReceived",
-                        connectedPhone: sock?.user?.id.split(':')[0],
+                        instanceId: instanceId, // <--- AQUI ESTÁ A RESPOSTA DA SUA DÚVIDA
+                        connectedPhone: sock?.user?.id?.split(':')[0],
                         messageId: msg.key.id,
-                        fromMe: false,
-                        sender: {
-                            id: msg.key.remoteJid.split('@')[0],
-                            pushName: msg.pushName
-                        },
-                        msgContent: {
-                            text: msg.message?.conversation || msg.message?.extendedTextMessage?.text
-                        }
+                        sender: msg.key.remoteJid.split('@')[0],
+                        msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
                     };
-
+                    
                     try {
-                        console.log('Enviando Webhook para:', WEBHOOK_URL);
-                        // await axios.post(WEBHOOK_URL, webhookPayload);
+                        // Enviamos para o InfoBarber dizendo: "Essa msg chegou para a barbearia X"
+                        await axios.post(WEBHOOK_URL, webhookPayload);
                     } catch (e) {
-                        console.error('Erro ao enviar webhook', e);
+                        console.error('Erro webhook', e);
                     }
                 }
             }
         }
     });
+
+    return sock;
 }
 
-// INICIA A CONEXÃO
-connectToWhatsApp();
-
-// --- ROTAS DA API (ESPELHO DA W-API) ---
-
-// 1. Rota de Enviar Texto (Instância LITE)
-// POSTMAN: https://api.w-api.app/v1/message/send-text
-app.post('/v1/message/send-text', async (req: Request, res: Response): Promise<any> => {
-    try {
-        const { phone, message } = req.body;
-
-        if (!phone || !message) {
-            return res.status(400).json({ error: true, message: 'Phone e Message são obrigatórios' });
+// Inicializa as pastas existentes ao ligar o servidor (Reconecta quem já estava salvo)
+// Isso garante que se o servidor reiniciar, as barbearias voltam online sozinhas
+if (fs.existsSync('auth_info_baileys')) {
+    const existingSessions = fs.readdirSync('auth_info_baileys');
+    existingSessions.forEach(id => {
+        if (fs.statSync(path.join('auth_info_baileys', id)).isDirectory()) {
+            console.log(`Restaurando sessão: ${id}`);
+            startSession(id);
         }
+    });
+}
 
-        if (connectionStatus !== 'connected') {
-            return res.status(503).json({ error: true, message: 'Instância não conectada' });
-        }
+// --- ROTAS (Adaptação Multi-Tenant) ---
 
-        // Formata o número (Baileys precisa do sufixo @s.whatsapp.net)
-        const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
-
-        // Envia via Baileys
-        const result = await sock.sendMessage(jid, { text: message });
-
-        // RESPOSTA: Espelhando o formato da W-API
-        return res.json({
-            instanceId: "MEU-SISTEMA-PROPRIO",
-            messageId: result.key.id,
-            insertedId: "local-id-" + Date.now(), // Fake ID
-            error: false
-        });
-
-    } catch (error) {
-        console.error(error);
-        return res.status(500).json({ error: true, message: 'Erro ao enviar mensagem' });
-    }
-});
-
-// 2. Rota de Pegar QR Code (Instância LITE)
-// POSTMAN: https://api.w-api.app/v1/instance/qr-code
+// 1. Pegar QR Code (Cria a instância se não existir)
+// GET /v1/instance/qr-code?instanceId=barbearia_01
 app.get('/v1/instance/qr-code', async (req: Request, res: Response) => {
+    // Tenta pegar do query (?instanceId=...) ou do body (se for POST)
+    const instanceId = req.query.instanceId as string || req.body.instanceId;
+
+    if (!instanceId) {
+        return res.status(400).json({ error: true, message: "instanceId é obrigatório" });
+    }
+
+    // Se a sessão não existe, cria agora (Lazy Loading)
+    if (!sessions.has(instanceId)) {
+        await startSession(instanceId);
+    }
+
+    // Aguarda um pouquinho para ver se conecta ou gera QR
+    // (Gambiarra leve para dar tempo do Baileys gerar o primeiro QR)
+    await new Promise(r => setTimeout(r, 1000));
+
+    const session = sessions.get(instanceId);
     
-    // Se já estiver conectado, avisa
-    if (connectionStatus === 'connected') {
+    // Verifica status (se 'user' existe, está conectado)
+    if (session?.user) {
         return res.json({ error: false, message: "Instância já conectada", connected: true });
     }
 
-    if (!qrCodeData) {
-        return res.status(404).json({ error: true, message: "QR Code ainda não gerado. Aguarde..." });
+    const qr = qrCodes.get(instanceId);
+
+    if (!qr) {
+        return res.status(404).json({ error: true, message: "Gerando QR Code... Tente novamente em 2s" });
     }
 
-    // W-API retorna o base64 direto no JSON
-    // A gente usa uma lib para gerar a imagem do QR Code em Base64
-    
-    const base64Image = await QRCode.toDataURL(qrCodeData);
-
+    const base64Image = await QRCode.toDataURL(qr);
     return res.json({
         error: false,
-        instanceId: "MEU-SISTEMA-PROPRIO",
-        qrcode: base64Image // Formato: "data:image/png;base64,..."
+        instanceId: instanceId,
+        qrcode: base64Image
     });
 });
 
-// 3. Rota de Status (Instância LITE)
-// POSTMAN: https://api.w-api.app/v1/instance/status-instance
+// 2. Enviar Texto
+// POST /v1/message/send-text
+app.post('/v1/message/send-text', async (req: Request, res: Response): Promise<any> => {
+    // Agora o InfoBarber PRECISA mandar o instanceId no JSON ou na URL
+    const { phone, message, instanceId } = req.body; 
+    // OBS: Se o InfoBarber manda instanceId na URL (query), use req.query.instanceId
+
+    // Prioridade: Body > Query
+    const targetInstance = instanceId || req.query.instanceId;
+
+    if (!targetInstance || !sessions.has(targetInstance as string)) {
+        return res.status(404).json({ error: true, message: "Instância não encontrada ou desconectada" });
+    }
+
+    const sock = sessions.get(targetInstance as string);
+
+    // Verifica se está realmente conectado
+    if (!sock.user) {
+        return res.status(503).json({ error: true, message: "Instância existe mas não está conectada ao WhatsApp" });
+    }
+
+    try {
+        const jid = `${phone.replace(/\D/g, '')}@s.whatsapp.net`;
+        const result = await sock.sendMessage(jid, { text: message });
+
+        return res.json({
+            error: false,
+            instanceId: targetInstance,
+            messageId: result.key.id
+        });
+    } catch (error) {
+        console.error(error);
+        return res.status(500).json({ error: true, message: "Erro ao enviar" });
+    }
+});
+
+// 3. Status
 app.get('/v1/instance/status-instance', (req: Request, res: Response) => {
+    const instanceId = req.query.instanceId as string;
+    
+    if (!instanceId || !sessions.has(instanceId)) {
+         return res.json({ instanceId: instanceId, connected: false });
+    }
+
+    const sock = sessions.get(instanceId);
     return res.json({
-        instanceId: "MEU-SISTEMA-PROPRIO",
-        connected: connectionStatus === 'connected'
+        instanceId: instanceId,
+        connected: !!sock.user // Retorna true se tiver usuário logado
     });
 });
 
-// Inicia o servidor Express
+// 4. Logout
+app.post('/v1/instance/logout', async (req: Request, res: Response) => {
+    const instanceId = req.query.instanceId as string || req.body.instanceId;
+    
+    if (instanceId && sessions.has(instanceId)) {
+        const sock = sessions.get(instanceId);
+        await sock.logout();
+        sessions.delete(instanceId);
+        qrCodes.delete(instanceId);
+        // Removemos a pasta para garantir que o próximo login seja limpo
+        const sessionPath = path.join('auth_info_baileys', instanceId);
+        fs.rmSync(sessionPath, { recursive: true, force: true });
+        
+        return res.json({ error: false, message: "Desconectado" });
+    }
+    return res.json({ error: false, message: "Sessão não encontrada" });
+});
+
+// --- ROTA VISUAL (Para testar no navegador) ---
+app.get('/connect', async (req: Request, res: Response) => {
+    // Exige passar ?instanceId=nome_da_loja
+    const instanceId = req.query.instanceId as string;
+    if (!instanceId) return res.send("Informe ?instanceId=nome_da_loja na URL");
+
+    // Lógica igual à do JSON, mas retorna HTML
+    if (!sessions.has(instanceId)) await startSession(instanceId);
+    await new Promise(r => setTimeout(r, 1000));
+    const session = sessions.get(instanceId);
+    
+    if (session?.user) return res.send("<h1>Conectado!</h1>");
+    const qr = qrCodes.get(instanceId);
+    if (!qr) return res.send("Generating QR... Refresh page.");
+    
+    const base64Image = await QRCode.toDataURL(qr);
+    return res.send(`<img src="${base64Image}" /> <script>setTimeout(()=>location.reload(), 5000)</script>`);
+});
+
 app.listen(PORT, () => {
-    console.log(`🚀 API Espelho W-API rodando na porta ${PORT}`);
-    console.log(`👉 Endpoint Texto: http://localhost:${PORT}/v1/message/send-text`);
+    console.log(`🚀 Servidor Multi-Tenant rodando na porta ${PORT}`);
 });
