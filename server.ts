@@ -14,7 +14,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL; 
 
-// --- CACHE DE RETRY (Correção TypeScript) ---
+// --- CACHE & CONFIG ---
 const localMsgRetryMap = new Map<string, number>();
 const msgRetryCounterCache = {
     get: (key: string) => { return localMsgRetryMap.get(key) },
@@ -27,7 +27,9 @@ const sessions = new Map<string, any>();
 const qrCodes = new Map<string, string>();
 
 async function startSession(instanceId: string) {
-    // Se a sessão existe e o socket está aberto, retorna ela
+    // Proteção extra contra pastas de sistema
+    if (instanceId === 'lost+found' || instanceId === '.DS_Store') return;
+
     if (sessions.has(instanceId) && !sessions.get(instanceId).ws.isClosed) {
         return sessions.get(instanceId);
     }
@@ -74,9 +76,7 @@ async function startSession(instanceId: string) {
             } else {
                 sessions.delete(instanceId);
                 qrCodes.delete(instanceId);
-                if (fs.existsSync(sessionPath)) {
-                    fs.rmSync(sessionPath, { recursive: true, force: true });
-                }
+                if (fs.existsSync(sessionPath)) fs.rmSync(sessionPath, { recursive: true, force: true });
             }
         } else if (connection === 'open') {
             console.log(`✅ Conexão estabelecida: ${instanceId}`);
@@ -84,20 +84,33 @@ async function startSession(instanceId: string) {
         }
     });
 
-    // WEBHOOK
+    // --- WEBHOOK MONITOR ---
     sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
         if (type === 'notify') {
             for (const msg of messages) {
+                // Só processa se não for mensagem minha e se tiver URL configurada
                 if (!msg.key.fromMe && WEBHOOK_URL) {
+                    
+                    console.log(`📩 Mensagem recebida em ${instanceId}. Tentando enviar Webhook...`);
+                    
                     try {
-                        await axios.post(WEBHOOK_URL, {
+                        const payload = {
                             event: "webhookReceived",
                             instanceId: instanceId,
                             connectedPhone: sock?.user?.id?.split(':')[0],
+                            sender: msg.key.remoteJid?.split('@')[0],
                             msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
-                        });
-                    } catch (e) {
-                        // Silencia erro de webhook
+                        };
+
+                        // Envia para o Supabase/Lovable
+                        await axios.post(WEBHOOK_URL, payload);
+                        console.log(`🚀 WEBHOOK ENVIADO COM SUCESSO PARA: ${WEBHOOK_URL}`);
+                        
+                    } catch (e: any) {
+                        console.error(`❌ ERRO NO WEBHOOK: ${e.message}`);
+                        if (e.response) {
+                            console.error(`Status: ${e.response.status}, Data: ${JSON.stringify(e.response.data)}`);
+                        }
                     }
                 }
             }
@@ -107,12 +120,14 @@ async function startSession(instanceId: string) {
     return sock;
 }
 
-// Inicia sessões salvas (Auto-Start)
+// Inicia sessões salvas (Auto-Start Corrigido)
 if (fs.existsSync('auth_info_baileys')) {
     const existingSessions = fs.readdirSync('auth_info_baileys');
     existingSessions.forEach(id => {
-        if (id !== '.DS_Store' && fs.statSync(path.join('auth_info_baileys', id)).isDirectory()) {
-            console.log(`Restaurando: ${id}`);
+        const fullPath = path.join('auth_info_baileys', id);
+        // IGNORA ARQUIVOS DE SISTEMA E lost+found
+        if (id !== '.DS_Store' && id !== 'lost+found' && fs.statSync(fullPath).isDirectory()) {
+            console.log(`Restaurando sessão: ${id}`);
             startSession(id);
         }
     });
@@ -120,25 +135,14 @@ if (fs.existsSync('auth_info_baileys')) {
 
 // --- ROTAS API ---
 
-// 1. Rota de Status (NOVA - A que faltava)
 app.get('/v1/instance/status-instance', (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
-    
     if (!instanceId) return res.status(400).json({ error: true, message: "instanceId obrigatório" });
-
     const session = sessions.get(instanceId);
-    
-    // Verifica se a sessão existe na memória E se tem usuário logado
     const isConnected = !!(session && session.user);
-
-    return res.json({
-        error: false,
-        instanceId: instanceId,
-        connected: isConnected
-    });
+    return res.json({ error: false, instanceId: instanceId, connected: isConnected });
 });
 
-// 2. Rota QR Code
 app.get('/v1/instance/qr-code', async (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
     if (!instanceId) return res.status(400).json({ error: true, message: "Falta instanceId" });
@@ -156,7 +160,6 @@ app.get('/v1/instance/qr-code', async (req: Request, res: Response) => {
     return res.json({ error: false, instanceId, qrcode: base64Image });
 });
 
-// 3. Enviar Mensagem
 app.post('/v1/message/send-text', async (req: Request, res: Response): Promise<any> => {
     const { phone, message, instanceId } = req.body;
     const target = instanceId || req.query.instanceId;
@@ -171,11 +174,11 @@ app.post('/v1/message/send-text', async (req: Request, res: Response): Promise<a
         const result = await sock.sendMessage(jid, { text: message });
         return res.json({ error: false, messageId: result.key.id });
     } catch (error) {
+        console.error("Erro ao enviar msg:", error);
         return res.status(500).json({ error: true });
     }
 });
 
-// 4. Rota de Reset
 app.get('/v1/instance/reset', async (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
     if (!instanceId) return res.status(400).send("Falta instanceId");
@@ -185,14 +188,11 @@ app.get('/v1/instance/reset', async (req: Request, res: Response) => {
         sessions.delete(instanceId);
         qrCodes.delete(instanceId);
     }
-
     const p = path.join('auth_info_baileys', instanceId);
     if (fs.existsSync(p)) fs.rmSync(p, { recursive: true, force: true });
-
     return res.json({ message: "Resetado com sucesso." });
 });
 
-// 5. Rota Visual HTML
 app.get('/connect', async (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
     if (!instanceId) return res.send("Use ?instanceId=SEU_ID");
@@ -205,17 +205,8 @@ app.get('/connect', async (req: Request, res: Response) => {
 
     const qr = qrCodes.get(instanceId);
     if (!qr) return res.send("<meta http-equiv='refresh' content='2'><h2>Gerando QR... aguarde...</h2>");
-
     const img = await QRCode.toDataURL(qr);
-    return res.send(`
-        <div style="text-align:center; font-family:sans-serif;">
-            <h2>Escaneie para Conectar</h2>
-            <img src="${img}" width="300" />
-            <br><br>
-            <p>Se der erro no celular, tente novamente.</p>
-            <script>setTimeout(()=>location.reload(), 5000)</script>
-        </div>
-    `);
+    return res.send(`<div style="text-align:center"><h2>Escaneie para Conectar</h2><img src="${img}" width="300" /></div>`);
 });
 
 app.listen(PORT, () => console.log(`Rodando na porta ${PORT}`));
