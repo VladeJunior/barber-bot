@@ -38,8 +38,16 @@ async function startSession(instanceId: string) {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        browser: Browsers.macOS('Desktop'),
-        syncFullHistory: false
+        // MUDANÇA 1: Usar Ubuntu/Chrome (mais estável em servidores Linux/Docker)
+        browser: Browsers.ubuntu('Chrome'),
+        // MUDANÇA 2: Aumentar timeouts para evitar que o celular desista
+        connectTimeoutMs: 60000, 
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        emitOwnEvents: true,
+        retryRequestDelayMs: 250,
+        // MUDANÇA 3: Ignorar chamadas de histórico antigo (deixa mais leve)
+        syncFullHistory: false 
     });
 
     // Salva na memória
@@ -223,7 +231,37 @@ app.post('/v1/instance/logout', async (req: Request, res: Response) => {
     }
     return res.json({ error: false, message: "Sessão não encontrada" });
 });
+// 5. Rota de Reset (Apaga a sessão e força novo QR Code)
+// POST /v1/instance/reset?instanceId=barbearia_01
+app.post('/v1/instance/reset', async (req: Request, res: Response) => {
+    const instanceId = req.query.instanceId as string || req.body.instanceId;
+    
+    if (!instanceId) return res.status(400).json({ error: true, message: "instanceId obrigatório" });
 
+    // 1. Desconecta se estiver rodando
+    if (sessions.has(instanceId)) {
+        const sock = sessions.get(instanceId);
+        sock.end(undefined); // Encerra a conexão brutalmente
+        sessions.delete(instanceId);
+        qrCodes.delete(instanceId);
+    }
+
+    // 2. Apaga os arquivos físicos (O "Hard Reset")
+    const sessionPath = path.join('auth_info_baileys', instanceId);
+    if (fs.existsSync(sessionPath)) {
+        try {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+            console.log(`Pasta de sessão ${instanceId} apagada.`);
+        } catch (e) {
+            console.error("Erro ao apagar pasta:", e);
+        }
+    }
+
+    return res.json({ 
+        error: false, 
+        message: `Instância ${instanceId} resetada. Pode pedir novo QR Code agora.` 
+    });
+});
 // --- ROTA VISUAL (Para testar no navegador) ---
 app.get('/connect', async (req: Request, res: Response) => {
     // Exige passar ?instanceId=nome_da_loja
