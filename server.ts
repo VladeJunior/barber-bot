@@ -1,5 +1,5 @@
 import express, { Request, Response } from 'express';
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } from '@whiskeysockets/baileys';
+import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import cors from 'cors';
 import axios from 'axios';
@@ -14,8 +14,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL; 
 
-// --- CACHE DE RETRY ---
-// Lógica simples para guardar tentativas de mensagem
+// --- CACHE DE RETRY (Correção TypeScript) ---
 const localMsgRetryMap = new Map<string, number>();
 const msgRetryCounterCache = {
     get: (key: string) => { return localMsgRetryMap.get(key) },
@@ -43,14 +42,8 @@ async function startSession(instanceId: string) {
         version,
         auth: state,
         printQRInTerminal: false,
-        
-        // --- CONFIGURAÇÃO BLINDADA ---
-        // Usamos 'as any' para o TypeScript parar de reclamar do Cache
         msgRetryCounterCache: msgRetryCounterCache as any, 
-        
-        // Navegador genérico que passa bem em servidores Linux
         browser: ["InfoBarber", "Chrome", "120.0.6099.0"], 
-        
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         emitOwnEvents: true,
@@ -76,13 +69,11 @@ async function startSession(instanceId: string) {
             const reason = (lastDisconnect?.error as Boom)?.output?.statusCode;
             console.log(`Conexão fechada: ${instanceId}. Razão: ${reason}`);
 
-            // Se não for logout (401), tenta reconectar
             if (reason !== DisconnectReason.loggedOut) {
                 setTimeout(() => startSession(instanceId), 3000);
             } else {
                 sessions.delete(instanceId);
                 qrCodes.delete(instanceId);
-                // Limpeza completa se for logout real
                 if (fs.existsSync(sessionPath)) {
                     fs.rmSync(sessionPath, { recursive: true, force: true });
                 }
@@ -129,6 +120,25 @@ if (fs.existsSync('auth_info_baileys')) {
 
 // --- ROTAS API ---
 
+// 1. Rota de Status (NOVA - A que faltava)
+app.get('/v1/instance/status-instance', (req: Request, res: Response) => {
+    const instanceId = req.query.instanceId as string;
+    
+    if (!instanceId) return res.status(400).json({ error: true, message: "instanceId obrigatório" });
+
+    const session = sessions.get(instanceId);
+    
+    // Verifica se a sessão existe na memória E se tem usuário logado
+    const isConnected = !!(session && session.user);
+
+    return res.json({
+        error: false,
+        instanceId: instanceId,
+        connected: isConnected
+    });
+});
+
+// 2. Rota QR Code
 app.get('/v1/instance/qr-code', async (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
     if (!instanceId) return res.status(400).json({ error: true, message: "Falta instanceId" });
@@ -146,6 +156,7 @@ app.get('/v1/instance/qr-code', async (req: Request, res: Response) => {
     return res.json({ error: false, instanceId, qrcode: base64Image });
 });
 
+// 3. Enviar Mensagem
 app.post('/v1/message/send-text', async (req: Request, res: Response): Promise<any> => {
     const { phone, message, instanceId } = req.body;
     const target = instanceId || req.query.instanceId;
@@ -164,7 +175,7 @@ app.post('/v1/message/send-text', async (req: Request, res: Response): Promise<a
     }
 });
 
-// Rota de Reset (GET)
+// 4. Rota de Reset
 app.get('/v1/instance/reset', async (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
     if (!instanceId) return res.status(400).send("Falta instanceId");
@@ -181,7 +192,7 @@ app.get('/v1/instance/reset', async (req: Request, res: Response) => {
     return res.json({ message: "Resetado com sucesso." });
 });
 
-// Rota Visual HTML
+// 5. Rota Visual HTML
 app.get('/connect', async (req: Request, res: Response) => {
     const instanceId = req.query.instanceId as string;
     if (!instanceId) return res.send("Use ?instanceId=SEU_ID");
