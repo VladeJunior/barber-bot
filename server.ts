@@ -84,46 +84,46 @@ async function startSession(instanceId: string) {
         }
     });
 
-    // --- WEBHOOK MONITOR ---
+    // --- WEBHOOK MONITOR (MODO INSPETOR) ---
     sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
         if (type === 'notify') {
             for (const msg of messages) {
-                // 1. Ignora mensagens enviadas por mim
-                if (msg.key.fromMe) continue;
-
-                // 2. PEGA O JID COMPLETO (ex: 5519...@s.whatsapp.net ou ...@lid)
-                const remoteJid = msg.key.remoteJid;
-                
-                // 3. FILTRO ANTI-LID: Se for @lid, ignora (espera vir o do telefone)
-                // O WhatsApp costuma mandar os dois eventos. Vamos pegar só o de telefone.
-                if (remoteJid.includes('@lid')) {
-                    console.log(`⚠️ Ignorando mensagem vinda de LID: ${remoteJid}`);
-                    continue;
-                }
-
-                // Só processa se tiver URL configurada
-                if (WEBHOOK_URL) {
+                if (!msg.key.fromMe && WEBHOOK_URL) {
                     
-                    console.log(`📩 Mensagem recebida de: ${remoteJid}`); // Log para conferir
+                    // 1. Log de Raio-X (Para descobrirmos onde está o número)
+                    console.log('🔍 RAIO-X DA MENSAGEM:', JSON.stringify(msg, null, 2));
+
+                    const remoteJid = msg.key.remoteJid;
+                    const participant = msg.key.participant; // Em alguns casos o número tá aqui
+
+                    // Tenta achar o número real (Fallback)
+                    // Se o remoteJid for LID, tenta pegar do participant. Se não tiver, usa o LID mesmo.
+                    let senderNumber = remoteJid.split('@')[0];
                     
+                    if (remoteJid.includes('@lid') && participant) {
+                        senderNumber = participant.split('@')[0];
+                        console.log(`💡 Achei o número real no participant: ${senderNumber}`);
+                    }
+
                     try {
                         const payload = {
                             event: "webhookReceived",
                             instanceId: instanceId,
                             connectedPhone: sock?.user?.id?.split(':')[0],
-                            // Remove o @s.whatsapp.net e pega só o número limpo
-                            sender: remoteJid.split('@')[0], 
+                            sender: senderNumber, // Manda o melhor número que achamos
+                            rawId: remoteJid,     // Manda o ID original também pra debug
                             msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
                         };
 
-                        if (!payload.msgContent) continue; // Ignora msg vazia
+                        if (!payload.msgContent) continue; 
 
-                        // Envia para o Supabase/Lovable
+                        console.log(`📤 Enviando para Supabase: ${payload.sender} diz "${payload.msgContent}"`);
+                        
+                        // Envia para o Supabase
                         await axios.post(WEBHOOK_URL, payload);
-                        console.log(`🚀 WEBHOOK ENVIADO: ${payload.sender} disse "${payload.msgContent}"`);
                         
                     } catch (e: any) {
-                        console.error(`❌ ERRO NO WEBHOOK: ${e.message}`);
+                        console.error(`❌ ERRO WEBHOOK: ${e.message}`);
                     }
                 }
             }
