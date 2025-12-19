@@ -1,18 +1,12 @@
 {
   "compilerOptions": {
-    /* Configuração de Módulos */
     "target": "ES2020",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "esModuleInterop": true,
-    
-    /* Configuração de Rigor */
     "strict": true,
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    
-    /* Saída */
-    "outDir": "./dist",
+    "outDir": "./dist",  
     "rootDir": "./"
   },
   "include": ["server.ts"],
