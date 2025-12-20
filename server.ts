@@ -84,43 +84,35 @@ async function startSession(instanceId: string) {
         }
     });
 
-    // --- WEBHOOK MONITOR (MODO INSPETOR) ---
+    // --- WEBHOOK MONITOR (COM NOME DO USUÁRIO) ---
     sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
         if (type === 'notify') {
             for (const msg of messages) {
-                // Ignora mensagens enviadas por mim
                 if (msg.key.fromMe) continue;
 
                 if (WEBHOOK_URL) {
                     try {
                         const key = msg.key;
-                        
-                        // --- A LÓGICA DE OURO ---
-                        // 1. Tenta pegar o 'remoteJidAlt' (que vimos no log que tem o número certo)
-                        // 2. Se não tiver, tenta o 'participant' (comum em grupos)
-                        // 3. Se não tiver, usa o 'remoteJid' padrão mesmo
-                        // Usamos (key as any) porque o TypeScript oficial do Baileys talvez não conheça esse campo novo ainda
                         const realJid = (key as any).remoteJidAlt || key.participant || key.remoteJid;
-
-                        // Limpa para pegar só o número (remove @s.whatsapp.net ou @lid)
                         const senderNumber = realJid ? realJid.split('@')[0] : "";
 
-                        // Se por algum motivo o sender ainda for um LID (começar com 1 e ser longo), ignora?
-                        // Não, vamos mandar assim mesmo, mas o remoteJidAlt deve resolver 99% dos casos.
+                        // --- CAPTURA O NOME ---
+                        // O pushName é o nome que a pessoa configurou no perfil do WhatsApp dela
+                        const contactName = msg.pushName || "Cliente WhatsApp";
 
                         const payload = {
                             event: "webhookReceived",
                             instanceId: instanceId,
                             connectedPhone: sock?.user?.id?.split(':')[0],
-                            sender: senderNumber, // Agora vai ser o 5519...
+                            sender: senderNumber,
+                            senderName: contactName, // <--- CAMPO NOVO AQUI
                             msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
                         };
 
                         if (!payload.msgContent || !payload.sender) continue;
 
-                        console.log(`📤 Enviando para Supabase: ${payload.sender} diz "${payload.msgContent}"`);
+                        console.log(`📤 Enviando: ${payload.senderName} (${payload.sender}) diz "${payload.msgContent}"`);
                         
-                        // Envia para o Supabase
                         await axios.post(WEBHOOK_URL, payload);
                         
                     } catch (e: any) {
