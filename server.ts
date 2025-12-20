@@ -88,34 +88,35 @@ async function startSession(instanceId: string) {
     sock.ev.on('messages.upsert', async ({ messages, type }: any) => {
         if (type === 'notify') {
             for (const msg of messages) {
-                if (!msg.key.fromMe && WEBHOOK_URL) {
-                    
-                    // 1. Log de Raio-X (Para descobrirmos onde está o número)
-                    console.log('🔍 RAIO-X DA MENSAGEM:', JSON.stringify(msg, null, 2));
+                // Ignora mensagens enviadas por mim
+                if (msg.key.fromMe) continue;
 
-                    const remoteJid = msg.key.remoteJid;
-                    const participant = msg.key.participant; // Em alguns casos o número tá aqui
-
-                    // Tenta achar o número real (Fallback)
-                    // Se o remoteJid for LID, tenta pegar do participant. Se não tiver, usa o LID mesmo.
-                    let senderNumber = remoteJid.split('@')[0];
-                    
-                    if (remoteJid.includes('@lid') && participant) {
-                        senderNumber = participant.split('@')[0];
-                        console.log(`💡 Achei o número real no participant: ${senderNumber}`);
-                    }
-
+                if (WEBHOOK_URL) {
                     try {
+                        const key = msg.key;
+                        
+                        // --- A LÓGICA DE OURO ---
+                        // 1. Tenta pegar o 'remoteJidAlt' (que vimos no log que tem o número certo)
+                        // 2. Se não tiver, tenta o 'participant' (comum em grupos)
+                        // 3. Se não tiver, usa o 'remoteJid' padrão mesmo
+                        // Usamos (key as any) porque o TypeScript oficial do Baileys talvez não conheça esse campo novo ainda
+                        const realJid = (key as any).remoteJidAlt || key.participant || key.remoteJid;
+
+                        // Limpa para pegar só o número (remove @s.whatsapp.net ou @lid)
+                        const senderNumber = realJid ? realJid.split('@')[0] : "";
+
+                        // Se por algum motivo o sender ainda for um LID (começar com 1 e ser longo), ignora?
+                        // Não, vamos mandar assim mesmo, mas o remoteJidAlt deve resolver 99% dos casos.
+
                         const payload = {
                             event: "webhookReceived",
                             instanceId: instanceId,
                             connectedPhone: sock?.user?.id?.split(':')[0],
-                            sender: senderNumber, // Manda o melhor número que achamos
-                            rawId: remoteJid,     // Manda o ID original também pra debug
+                            sender: senderNumber, // Agora vai ser o 5519...
                             msgContent: msg.message?.conversation || msg.message?.extendedTextMessage?.text
                         };
 
-                        if (!payload.msgContent) continue; 
+                        if (!payload.msgContent || !payload.sender) continue;
 
                         console.log(`📤 Enviando para Supabase: ${payload.sender} diz "${payload.msgContent}"`);
                         
